@@ -64,7 +64,8 @@ def seed(c, reset=False):
                 continue
             stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
             db.accounts.insert_one({'_id': aid, 'holder': name, 'number': f'GB-0000-{i}',
-                'balance_cents': balance, 'currency': 'USD', 'status': 'active', 'created_at': stamp}, session=s)
+                'balance_cents': balance, 'currency': 'USD', 'status': 'active', 'created_at': stamp,
+                'last_transaction_id': f'SEED-{i}'}, session=s)
             db.transactions.insert_one({'_id': f'SEED-{i}', 'account_id': aid, 'type': 'opening',
                 'amount_cents': balance, 'balance_after_cents': balance, 'timestamp': stamp,
                 'region': 'usa', 'primary': HOSTS['usa'], 'status': 'committed'}, session=s)

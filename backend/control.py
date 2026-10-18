@@ -7,10 +7,15 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pymongo.errors import PyMongoError
+from pymongo.read_concern import ReadConcern
 from common import REGIONS, HOSTS, TOKEN, direct, client, now, public, seed
+from observations import RecordObserver, ElectionObserver
 
 events = deque(maxlen=100)
 previous = {}
+record_observer = RecordObserver()
+election_observer = ElectionObserver()
+observation_lock = asyncio.Lock()
 admin_lock = asyncio.Lock()
 condition = asyncio.Condition()
 maintenance = False
@@ -19,8 +24,10 @@ local_clients = {r: direct(r) for r in REGIONS}
 cluster = client()
 
 
-def event(message):
-    events.appendleft({'id': str(uuid4()), 'timestamp': now().isoformat(), 'message': message})
+def event(message, **details):
+    entry = {'id': str(uuid4()), 'timestamp': now().isoformat(), 'message': message, **details}
+    events.appendleft(entry)
+    return entry
 
 
 @asynccontextmanager
@@ -108,8 +115,6 @@ async def bank(region: str, path: str, request: Request):
                 'No new banking request was forwarded. Reconcile any earlier pending request after recovery.')
         payload = await internal(region, 8001, '/' + path, request.method,
                                  await request.json() if request.method == 'POST' else None)
-        if request.method == 'POST':
-            event(f'{region.upper()}: {payload["type"]} acknowledged, request {payload["id"]}, primary {payload["primary"]}.')
         return payload
 
 
@@ -120,13 +125,18 @@ def inspect(region):
         status = c.admin.command('replSetGetStatus')
         me = next(m for m in status['members'] if m.get('self'))
         accounts = list(c.bank.accounts.find({}).sort('_id', 1))
-        latest = c.bank.transactions.find_one(sort=[('timestamp', -1), ('_id', -1)])
+        transactions = list(c.bank.transactions.find({}).sort([('timestamp', 1), ('_id', 1)]))
+        majority_transactions = [t['_id'] for t in c.bank.transactions.with_options(
+            read_concern=ReadConcern('majority')).find({}, {'_id': 1})]
+        latest = transactions[-1] if transactions else None
         applied = me.get('optimeDate')
         return {'region': region, 'host': HOSTS[region], 'reachable': True,
             'role': me['stateStr'], 'primary': hello.get('primary'),
             'election_id': str(hello.get('electionId', '')), 'applied_at': public(applied),
             'optime': str(me.get('optime', {}).get('ts', '')),
             'accounts': public(accounts), 'latest_transaction': public(latest),
+            'transactions': public(transactions),
+            'majority_transactions': majority_transactions,
             'peers': [{'name': m['name'], 'health': m['health'], 'state': m['stateStr'],
                        'message': m.get('lastHeartbeatMessage', '')} for m in status['members']]}
     except (PyMongoError, StopIteration) as e:
@@ -136,18 +146,25 @@ def inspect(region):
 
 @app.get('/api/status')
 async def status():
+    async with observation_lock:
+        return await observed_status()
+
+
+async def observed_status():
     states, nodes = await asyncio.gather(agent_states(), asyncio.gather(
         *(asyncio.to_thread(inspect, r) for r in REGIONS)))
     for node in nodes:
         node['network'] = states[node['region']]
-        key = (node['role'], node['network']['isolated'], node.get('optime'))
+        key = (node['role'], node['network']['isolated'])
         old = previous.get(node['region'])
         if old and old != key:
-            if old[:2] != key[:2]:
-                event(f'{node["region"].upper()}: observed {node["role"]}; isolated={key[1]}.')
-            elif old[2] != key[2]:
-                event(f'{node["region"].upper()}: replication advanced to {key[2]}.')
+            event(f'{node["region"].upper()}: observed {node["role"]}; isolated={key[1]}.')
         previous[node['region']] = key
+    election_observer.observe(nodes, event)
+    record_observer.observe(nodes, event)
+    for node in nodes:
+        node.pop('transactions', None)
+        node.pop('majority_transactions', None)
     return {'nodes': nodes, 'events': list(events), 'observed_at': now().isoformat(),
             'note': 'Node inspections are local, potentially stale reads; they are not a simultaneous snapshot.'}
 
@@ -182,7 +199,7 @@ async def restore():
 
 @app.post('/api/reset')
 async def reset():
-    global maintenance
+    global maintenance, record_observer
     async with admin_lock:
         async with condition:
             maintenance = True
@@ -191,8 +208,11 @@ async def reset():
             await restore_all()
             for _ in range(30):
                 try:
-                    await asyncio.to_thread(seed, cluster, True)
-                    event('Demo data reset: five original accounts and opening transactions restored.')
+                    async with observation_lock:
+                        await asyncio.to_thread(seed, cluster, True)
+                        record_observer = RecordObserver()
+                        events.clear()
+                        event('Demo data reset: five original accounts and opening transactions restored.')
                     return {'reset': True}
                 except PyMongoError:
                     await asyncio.sleep(1)

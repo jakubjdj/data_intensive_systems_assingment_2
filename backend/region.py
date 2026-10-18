@@ -70,7 +70,8 @@ def transact(body: Transaction):
         if body.type == 'withdrawal':
             delta = -delta
             query['balance_cents'] = {'$gte': body.amount_cents}
-        account = db.accounts.find_one_and_update(query, {'$inc': {'balance_cents': delta}},
+        account = db.accounts.find_one_and_update(query, {'$inc': {'balance_cents': delta},
+            '$set': {'last_transaction_id': key}},
             return_document=ReturnDocument.AFTER, session=s)
         if not account:
             raise HTTPException(422, 'Insufficient funds, inactive account, or unknown account')
