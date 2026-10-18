@@ -1,0 +1,112 @@
+name: global-bank-tester
+x-mongo: &mongo
+  image: mongo:7.0.16
+  command: [mongod, --replSet, globalbank, --bind_ip_all, --oplogSize, '128']
+  restart: unless-stopped
+  healthcheck:
+    test: [CMD, mongosh, --quiet, --eval, 'quit(db.adminCommand({ping:1}).ok ? 0 : 1)']
+    interval: 5s
+    timeout: 4s
+    retries: 30
+x-region: &region
+  build: ./backend
+  command: [uvicorn, region:app, --host, 0.0.0.0, --port, '8001']
+  restart: unless-stopped
+  environment: &env
+    LAB_TOKEN: ${LAB_TOKEN:-local-classroom-lab}
+  depends_on:
+    init:
+      condition: service_completed_successfully
+x-agent: &agent
+  build: ./infra/agent
+  cap_add: [NET_ADMIN]
+  restart: unless-stopped
+  environment: *env
+services:
+  mongo-usa:
+    <<: *mongo
+    networks:
+      lab: {ipv4_address: 172.29.83.11}
+    volumes: [usa-data:/data/db]
+  mongo-france:
+    <<: *mongo
+    networks:
+      lab: {ipv4_address: 172.29.83.12}
+    volumes: [france-data:/data/db]
+  mongo-australia:
+    <<: *mongo
+    networks:
+      lab: {ipv4_address: 172.29.83.13}
+    volumes: [australia-data:/data/db]
+  init:
+    build: ./backend
+    command: [python, initialize.py]
+    networks: [lab]
+    depends_on:
+      mongo-usa: {condition: service_healthy}
+      mongo-france: {condition: service_healthy}
+      mongo-australia: {condition: service_healthy}
+  region-usa:
+    <<: *region
+    network_mode: service:mongo-usa
+    environment:
+      <<: *env
+      REGION: usa
+  region-france:
+    <<: *region
+    network_mode: service:mongo-france
+    environment:
+      <<: *env
+      REGION: france
+  region-australia:
+    <<: *region
+    network_mode: service:mongo-australia
+    environment:
+      <<: *env
+      REGION: australia
+  agent-usa:
+    <<: *agent
+    network_mode: service:mongo-usa
+    environment:
+      <<: *env
+      REGION: usa
+  agent-france:
+    <<: *agent
+    network_mode: service:mongo-france
+    environment:
+      <<: *env
+      REGION: france
+  agent-australia:
+    <<: *agent
+    network_mode: service:mongo-australia
+    environment:
+      <<: *env
+      REGION: australia
+  api:
+    build: ./backend
+    command: [uvicorn, control:app, --host, 0.0.0.0, --port, '8000']
+    networks: [lab]
+    restart: unless-stopped
+    environment: *env
+    depends_on:
+      init: {condition: service_completed_successfully}
+      region-usa: {condition: service_started}
+      region-france: {condition: service_started}
+      region-australia: {condition: service_started}
+      agent-usa: {condition: service_started}
+      agent-france: {condition: service_started}
+      agent-australia: {condition: service_started}
+  web:
+    build: ./frontend
+    ports: ['127.0.0.1:3000:80']
+    networks: [lab]
+    restart: unless-stopped
+    depends_on: [api]
+networks:
+  lab:
+    ipam:
+      config: [{subnet: 172.29.83.0/24}]
+volumes:
+  usa-data:
+  france-data:
+  australia-data:
